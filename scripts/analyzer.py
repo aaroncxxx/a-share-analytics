@@ -1,445 +1,460 @@
 #!/usr/bin/env python3
 """
-A股微博热搜分析 v1.1
-- 微博热搜抓取 + A股关键词筛选（增强版）
+A股微博热搜分析 v2.0
+- 微博热搜抓取 + A股关键词筛选
 - A股行情数据（大盘/涨停/跌停/板块）
 - 北向资金数据
 - 热搜 vs 行情关联分析
 - 历史趋势对比 (--trend)
 - 本地快照缓存
+- 个股查询 (--stock)
+- 自选股 (--watchlist)
+- Markdown 导出 (--md)
+- 市场情绪指标
+- 板块轮动分析
+- 非交易日提示
 """
 
 import json
 import sys
 import os
+import time
+import argparse
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import akshare as ak
+    import warnings
+    warnings.filterwarnings("ignore")
+    HAS_AKSHARE = True
+except ImportError:
+    HAS_AKSHARE = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
+VERSION = "2.0.0"
 
 # ============================================================
-# 参数解析
+# 工具函数
 # ============================================================
-JSON_MODE = "--json" in sys.argv
-BRIEF_MODE = "--brief" in sys.argv
-NO_WEIBO = "--no-weibo" in sys.argv
-NO_MARKET = "--no-market" in sys.argv
-TREND_MODE = "--trend" in sys.argv
+def log(msg):
+    print(msg, file=sys.stderr)
+
+def format_hot(num):
+    if num >= 1000000:
+        return f"{num/1000000:.1f}万"
+    elif num >= 10000:
+        return f"{num/10000:.1f}万"
+    elif num >= 1000:
+        return f"{num/1000:.1f}千"
+    return str(num)
+
+def format_yi(num):
+    """格式化为亿"""
+    if abs(num) >= 10000:
+        return f"{num/10000:.2f}万亿"
+    return f"{num:.2f}亿"
+
+def is_trading_day():
+    """判断今天是否为交易日（简单判断：工作日=交易日，节假日不判断）"""
+    now = datetime.now()
+    # 9:00-15:30 之间视为交易时段
+    if now.weekday() >= 5:  # 周六日
+        return False
+    return True
+
+def get_last_trading_date():
+    """获取最近一个交易日日期"""
+    now = datetime.now()
+    # 如果是周末，回退到周五
+    offset = 0
+    if now.weekday() == 5:  # 周六
+        offset = 1
+    elif now.weekday() == 6:  # 周日
+        offset = 2
+    # 如果在盘前（9:30前），用前一天
+    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        offset += 1
+    return (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+
 
 # ============================================================
 # 1. 微博热搜抓取
 # ============================================================
 def fetch_weibo_hot(retries=2):
-    """获取微博实时热搜（带重试）"""
     url = "https://weibo.com/ajax/side/hotSearch"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://weibo.com",
-        "X-Requested-With": "XMLHttpRequest",
     }
-    
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                
             hot_list = data.get("data", {}).get("realtime", [])
-            results = []
-            for item in hot_list[:50]:
-                results.append({
+            return [
+                {
                     "rank": item.get("rank", 0),
                     "keyword": item.get("word", ""),
                     "hot": item.get("num", 0),
                     "category": item.get("category", ""),
                     "label": item.get("label_name", ""),
-                    "icon_desc": item.get("icon_desc", ""),
-                })
-            return results
+                }
+                for item in hot_list[:50]
+            ]
         except Exception as e:
             if attempt < retries:
-                import time
                 time.sleep(1)
                 continue
             log(f"⚠️  微博热搜获取失败: {e}")
             return []
 
 
-# 行业/板块关键词库（v1.1 增强）
 SECTOR_KEYWORDS = [
-    # 科技
     "AI", "人工智能", "芯片", "半导体", "算力", "光刻", "封装", "存储",
     "机器人", "具身智能", "自动驾驶", "智能驾驶", "车联网",
     "5G", "6G", "通信", "光纤", "光模块", "量子",
     "云计算", "大数据", "区块链", "元宇宙", "AR", "VR",
     "软件", "信创", "国产替代", "操作系统", "数据库",
-    # 新能源
     "新能源", "光伏", "风电", "储能", "锂电", "钠电", "氢能", "燃料电池",
     "充电桩", "特高压", "智能电网",
-    # 消费
     "白酒", "食品", "医药", "医疗", "中药", "生物", "疫苗",
     "消费", "免税", "旅游", "酒店", "餐饮",
-    # 金融地产
     "银行", "保险", "券商", "地产", "房地产", "基建", "水泥", "钢铁",
-    # 制造
     "军工", "航空", "航天", "船舶", "汽车", "零部件",
     "有色", "稀土", "黄金", "铜", "铝", "煤炭", "石油",
-    # 农业
     "农业", "种业", "养殖", "猪肉", "鸡肉",
-    # 其他热点
     "传媒", "游戏", "影视", "短剧", "网红", "直播",
 ]
 
-def filter_stock_keywords(hot_list):
-    """筛选A股相关关键词（v1.1 增强版）"""
-    # 精确匹配关键词
-    exact_keywords = [
-        "A股", "大A", "股市", "股票", "涨停", "跌停", "牛市", "熊市",
-        "基金", "证券", "券商", "上证", "深证", "创业板", "科创板",
-        "涨停板", "跌停板", "打板", "龙头", "妖股",
-        "利好", "利空", "暴跌", "暴涨", "反弹", "回调",
-        "北向资金", "主力", "游资", "散户",
-        "融资融券", "两融", "期权", "期货",
-        "大盘", "行情", "板块", "概念", "题材",
-    ]
-    
+EXACT_KEYWORDS = [
+    "A股", "大A", "股市", "股票", "涨停", "跌停", "牛市", "熊市",
+    "基金", "证券", "券商", "上证", "深证", "创业板", "科创板",
+    "涨停板", "跌停板", "打板", "龙头", "妖股",
+    "利好", "利空", "暴跌", "暴涨", "反弹", "回调",
+    "北向资金", "主力", "游资", "散户",
+    "融资融券", "两融", "期权", "期货",
+    "大盘", "行情", "板块", "概念", "题材",
+]
+
+def filter_stock_keywords(hot_list, watchlist=None):
     stock_related = []
-    seen_keywords = set()
-    
+    seen = set()
     for item in hot_list:
-        keyword = item["keyword"]
-        if keyword in seen_keywords:
+        kw = item["keyword"]
+        if kw in seen:
             continue
-        seen_keywords.add(keyword)
-        
-        # 精确匹配
+        seen.add(kw)
         matched = False
-        for kw in exact_keywords:
-            if kw in keyword:
-                item["match_reason"] = f"包含「{kw}」"
+        for ek in EXACT_KEYWORDS:
+            if ek in kw:
+                item["match_reason"] = f"包含「{ek}」"
                 stock_related.append(item)
                 matched = True
                 break
-        
-        # 板块关键词匹配
         if not matched:
             for sector in SECTOR_KEYWORDS:
-                if sector in keyword and len(keyword) <= 20:
+                if sector in kw and len(kw) <= 20:
                     item["match_reason"] = f"板块「{sector}」"
                     stock_related.append(item)
                     matched = True
                     break
-        
-        # 模糊匹配（兜底）
+        # v2.0: 收窄模糊匹配，只匹配 <=6 字符
         if not matched:
-            fuzzy_chars = ["股", "涨", "跌", "板"]
-            for ch in fuzzy_chars:
-                if ch in keyword and len(keyword) <= 10:
-                    item["match_reason"] = "模糊匹配"
-                    stock_related.append(item)
-                    break
-    
+            if any(ch in kw for ch in ["股", "涨", "跌"]) and len(kw) <= 6:
+                item["match_reason"] = "模糊匹配"
+                stock_related.append(item)
+    if watchlist:
+        stock_related = [i for i in stock_related if any(w in i["keyword"] for w in watchlist)]
     return stock_related
 
 
 # ============================================================
-# 2. A股行情数据 (AKShare)
+# 2. A股行情数据
 # ============================================================
 def fetch_market_overview():
-    """获取大盘指数"""
-    try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
-        indices = [
-            ("sh000001", "上证指数"),
-            ("sz399001", "深证成指"),
-            ("sz399006", "创业板指"),
-        ]
-        
-        results = []
-        for symbol, name in indices:
-            try:
-                df = ak.stock_zh_index_daily(symbol=symbol)
-                if df is not None and len(df) >= 2:
-                    last = df.iloc[-1]
-                    prev = df.iloc[-2]
-                    close = float(last["close"])
-                    prev_close = float(prev["close"])
-                    change_pct = (close - prev_close) / prev_close * 100
-                    results.append({
-                        "name": name,
-                        "close": round(close, 2),
-                        "change_pct": round(change_pct, 2),
-                    })
-            except Exception:
-                continue
-        
-        return results
-    except Exception as e:
-        log(f"⚠️  大盘数据获取失败: {e}")
+    if not HAS_AKSHARE:
         return []
+    results = []
+    for symbol, name in [("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指")]:
+        try:
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is not None and len(df) >= 2:
+                close = float(df.iloc[-1]["close"])
+                prev = float(df.iloc[-2]["close"])
+                pct = (close - prev) / prev * 100
+                results.append({"name": name, "close": round(close, 2), "change_pct": round(pct, 2)})
+        except Exception:
+            continue
+    return results
 
 
 def fetch_market_trend(days=5):
-    """获取大盘近N天趋势"""
-    try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
-        indices = [
-            ("sh000001", "上证指数"),
-            ("sz399001", "深证成指"),
-            ("sz399006", "创业板指"),
-        ]
-        
-        results = {}
-        for symbol, name in indices:
-            try:
-                df = ak.stock_zh_index_daily(symbol=symbol)
-                if df is not None and len(df) >= days:
-                    recent = df.tail(days)
-                    trend = []
-                    for _, row in recent.iterrows():
-                        trend.append({
-                            "date": str(row.get("date", "")),
-                            "close": round(float(row["close"]), 2),
-                        })
-                    # 计算趋势方向
-                    if len(trend) >= 2:
-                        start = trend[0]["close"]
-                        end = trend[-1]["close"]
-                        total_pct = (end - start) / start * 100
-                        results[name] = {
-                            "trend": trend,
-                            "total_change_pct": round(total_pct, 2),
-                            "direction": "📈" if total_pct > 0 else "📉" if total_pct < 0 else "➡️",
-                        }
-            except Exception:
-                continue
-        
-        return results
-    except Exception as e:
-        log(f"⚠️  趋势数据获取失败: {e}")
+    if not HAS_AKSHARE:
         return {}
+    results = {}
+    for symbol, name in [("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指")]:
+        try:
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is not None and len(df) >= days:
+                recent = df.tail(days)
+                trend = [{"date": str(r.get("date", "")), "close": round(float(r["close"]), 2)} for _, r in recent.iterrows()]
+                if len(trend) >= 2:
+                    total = (trend[-1]["close"] - trend[0]["close"]) / trend[0]["close"] * 100
+                    results[name] = {
+                        "trend": trend,
+                        "total_change_pct": round(total, 2),
+                        "direction": "📈" if total > 0 else "📉" if total < 0 else "➡️",
+                    }
+        except Exception:
+            continue
+    return results
 
 
 def fetch_zt_dt():
-    """获取涨停/跌停数据"""
+    if not HAS_AKSHARE:
+        return {"涨停": [], "跌停": []}
     today = datetime.now().strftime("%Y%m%d")
     result = {"涨停": [], "跌停": []}
-    
     try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
-        # 涨停板
-        try:
-            zt_df = ak.stock_zt_pool_em(date=today)
-            if zt_df is not None and not zt_df.empty:
-                for _, row in zt_df.head(15).iterrows():
-                    result["涨停"].append({
-                        "code": str(row.get("代码", "")),
-                        "name": str(row.get("名称", "")),
-                        "change_pct": float(row.get("涨跌幅", 0)),
-                        "reason": str(row.get("涨停原因", "")),
-                        "turnover": str(row.get("换手率", "")),
-                    })
-        except Exception:
-            pass
-        
-        # 跌停板
-        try:
-            dt_df = ak.stock_zt_pool_dtgc_em(date=today)
-            if dt_df is not None and not dt_df.empty:
-                for _, row in dt_df.head(15).iterrows():
-                    result["跌停"].append({
-                        "code": str(row.get("代码", "")),
-                        "name": str(row.get("名称", "")),
-                        "change_pct": float(row.get("涨跌幅", 0)),
-                    })
-        except Exception:
-            pass
-        
-    except Exception as e:
-        log(f"⚠️  涨停/跌停数据获取失败: {e}")
-    
+        zt_df = ak.stock_zt_pool_em(date=today)
+        if zt_df is not None and not zt_df.empty:
+            for _, row in zt_df.head(15).iterrows():
+                result["涨停"].append({
+                    "code": str(row.get("代码", "")),
+                    "name": str(row.get("名称", "")),
+                    "change_pct": float(row.get("涨跌幅", 0)),
+                    "reason": str(row.get("涨停原因", "")),
+                    "turnover": str(row.get("换手率", "")),
+                })
+    except Exception:
+        pass
+    try:
+        dt_df = ak.stock_zt_pool_dtgc_em(date=today)
+        if dt_df is not None and not dt_df.empty:
+            for _, row in dt_df.head(15).iterrows():
+                result["跌停"].append({
+                    "code": str(row.get("代码", "")),
+                    "name": str(row.get("名称", "")),
+                    "change_pct": float(row.get("涨跌幅", 0)),
+                })
+    except Exception:
+        pass
     return result
 
 
 def fetch_hot_sectors():
-    """获取热门板块"""
+    if not HAS_AKSHARE:
+        return []
     try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
         df = ak.stock_board_industry_name_em()
         if df is not None and not df.empty:
             sectors = []
             for _, row in df.head(15).iterrows():
+                try:
+                    lc = float(row["领涨股票-涨跌幅"]) if "领涨股票-涨跌幅" in row.index else 0
+                except (ValueError, TypeError):
+                    lc = 0
+                try:
+                    uc = int(row["上涨家数"]) if "上涨家数" in row.index else 0
+                except (ValueError, TypeError):
+                    uc = 0
+                try:
+                    dc = int(row["下跌家数"]) if "下跌家数" in row.index else 0
+                except (ValueError, TypeError):
+                    dc = 0
                 sectors.append({
                     "name": str(row.get("板块名称", "")),
                     "change_pct": float(row.get("涨跌幅", 0)),
                     "leader": str(row.get("领涨股票", "")),
-                    "leader_change": float(row.get("领涨股票-涨跌幅", 0)) if "领涨股票-涨跌幅" in row else 0,
-                    "up_count": int(row.get("上涨家数", 0)) if "上涨家数" in row else 0,
-                    "down_count": int(row.get("下跌家数", 0)) if "下跌家数" in row else 0,
+                    "leader_change": lc,
+                    "up_count": uc,
+                    "down_count": dc,
                 })
             return sectors
-        return []
     except Exception as e:
         log(f"⚠️  板块数据获取失败: {e}")
-        return []
+    return []
 
 
 def fetch_top_stocks():
-    """获取涨幅/跌幅前10"""
+    if not HAS_AKSHARE:
+        return {}
     try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty:
-            # 涨幅前10
-            top_up = df.nlargest(10, "涨跌幅")[["代码", "名称", "涨跌幅", "最新价", "成交额"]].to_dict("records")
-            # 跌幅前10
-            top_down = df.nsmallest(10, "涨跌幅")[["代码", "名称", "涨跌幅", "最新价", "成交额"]].to_dict("records")
-            # 成交额前10
-            top_volume = df.nlargest(10, "成交额")[["代码", "名称", "涨跌幅", "最新价", "成交额"]].to_dict("records")
-            
+            cols = ["代码", "名称", "涨跌幅", "最新价", "成交额"]
+            def to_list(sub):
+                return [{"code": str(r["代码"]), "name": str(r["名称"]),
+                         "change_pct": float(r["涨跌幅"]),
+                         "price": float(r["最新价"]) if r["最新价"] else 0,
+                         "volume": float(r["成交额"]) if r["成交额"] else 0} for _, r in sub.iterrows()]
             return {
-                "涨幅榜": [{"code": str(r["代码"]), "name": str(r["名称"]), "change_pct": float(r["涨跌幅"]), "price": float(r["最新价"]) if r["最新价"] else 0, "volume": float(r["成交额"]) if r["成交额"] else 0} for r in top_up],
-                "跌幅榜": [{"code": str(r["代码"]), "name": str(r["名称"]), "change_pct": float(r["涨跌幅"]), "price": float(r["最新价"]) if r["最新价"] else 0, "volume": float(r["成交额"]) if r["成交额"] else 0} for r in top_down],
-                "成交榜": [{"code": str(r["代码"]), "name": str(r["名称"]), "change_pct": float(r["涨跌幅"]), "price": float(r["最新价"]) if r["最新价"] else 0, "volume": float(r["成交额"]) if r["成交额"] else 0} for r in top_volume],
+                "涨幅榜": to_list(df.nlargest(10, "涨跌幅")),
+                "跌幅榜": to_list(df.nsmallest(10, "涨跌幅")),
+                "成交榜": to_list(df.nlargest(10, "成交额")),
             }
-        return {}
     except Exception as e:
         log(f"⚠️  个股排行获取失败: {e}")
+    return {}
+
+
+def fetch_single_stock(code):
+    """查询单只股票详情"""
+    if not HAS_AKSHARE:
+        return None
+    try:
+        df = ak.stock_zh_a_spot_em()
+        if df is not None and not df.empty:
+            row = df[df["代码"] == code]
+            if row.empty:
+                return None
+            r = row.iloc[0]
+            return {
+                "code": str(r.get("代码", "")),
+                "name": str(r.get("名称", "")),
+                "price": float(r.get("最新价", 0)),
+                "change_pct": float(r.get("涨跌幅", 0)),
+                "change_amt": float(r.get("涨跌额", 0)),
+                "volume": float(r.get("成交量", 0)),
+                "turnover": float(r.get("成交额", 0)),
+                "high": float(r.get("最高", 0)),
+                "low": float(r.get("最低", 0)),
+                "open": float(r.get("今开", 0)),
+                "prev_close": float(r.get("昨收", 0)),
+                "pe": r.get("市盈率-动态", ""),
+                "total_mv": r.get("总市值", ""),
+                "circ_mv": r.get("流通市值", ""),
+            }
+    except Exception as e:
+        log(f"⚠️  个股查询失败: {e}")
+    return None
+
+
+def fetch_market_stats():
+    """获取市场情绪统计（涨跌家数、涨停/跌停数）"""
+    if not HAS_AKSHARE:
         return {}
+    try:
+        df = ak.stock_zh_a_spot_em()
+        if df is not None and not df.empty:
+            total = len(df)
+            up = len(df[df["涨跌幅"] > 0])
+            down = len(df[df["涨跌幅"] < 0])
+            flat = total - up - down
+            return {
+                "total": total, "up": up, "down": down, "flat": flat,
+                "up_ratio": round(up / total * 100, 1) if total else 0,
+            }
+    except Exception:
+        pass
+    return {}
 
 
 # ============================================================
-# 2.5 北向资金数据 (v1.1 新增)
+# 2.5 北向资金
 # ============================================================
 def fetch_northbound_flow():
-    """获取北向资金（沪股通+深股通）"""
-    try:
-        import akshare as ak
-        import warnings
-        warnings.filterwarnings("ignore")
-        
-        result = {"沪股通": {}, "深股通": {}, "合计": {}}
-        
-        try:
-            # 北向资金实时流入
-            df = ak.stock_hsgt_north_net_flow_in_em()
-            if df is not None and not df.empty:
-                last_row = df.iloc[-1]
-                result["date"] = str(last_row.get("date", ""))
-                result["north_net"] = round(float(last_row.get("value", 0)), 2)
-        except Exception:
-            pass
-        
-        try:
-            # 沪股通+深股通 汇总
-            df2 = ak.stock_hsgt_fund_flow_summary_em()
-            if df2 is not None and not df2.empty:
-                last = df2.iloc[-1]
-                result["沪股通"] = {
-                    "buy": round(float(last.get("沪股通-买入", 0)), 2),
-                    "sell": round(float(last.get("沪股通-卖出", 0)), 2),
-                    "net": round(float(last.get("沪股通-净买入", 0)), 2),
-                }
-                result["深股通"] = {
-                    "buy": round(float(last.get("深股通-买入", 0)), 2),
-                    "sell": round(float(last.get("深股通-卖出", 0)), 2),
-                    "net": round(float(last.get("深股通-净买入", 0)), 2),
-                }
-                result["合计"] = {
-                    "net": round(result["沪股通"]["net"] + result["深股通"]["net"], 2),
-                }
-        except Exception:
-            pass
-        
-        return result
-    except Exception as e:
-        log(f"⚠️  北向资金获取失败: {e}")
+    if not HAS_AKSHARE:
         return {}
+    result = {"沪股通": {}, "深股通": {}, "合计": {}}
+    try:
+        df = ak.stock_hsgt_north_net_flow_in_em()
+        if df is not None and not df.empty:
+            last_row = df.iloc[-1]
+            result["date"] = str(last_row.get("date", ""))
+            result["north_net"] = round(float(last_row.get("value", 0)), 2)
+    except Exception:
+        pass
+    try:
+        df2 = ak.stock_hsgt_fund_flow_summary_em()
+        if df2 is not None and not df2.empty:
+            last = df2.iloc[-1]
+            # v2.0: 逐列容错
+            for prefix, key in [("沪股通", "沪股通"), ("深股通", "深股通")]:
+                try:
+                    result[key] = {
+                        "buy": round(float(last.get(f"{prefix}-买入", 0)), 2),
+                        "sell": round(float(last.get(f"{prefix}-卖出", 0)), 2),
+                        "net": round(float(last.get(f"{prefix}-净买入", 0)), 2),
+                    }
+                except (ValueError, TypeError):
+                    result[key] = {"buy": 0, "sell": 0, "net": 0}
+            hn = result["沪股通"].get("net", 0)
+            sn = result["深股通"].get("net", 0)
+            result["合计"]["net"] = round(hn + sn, 2)
+    except Exception:
+        pass
+    return result
 
 
 # ============================================================
 # 3. 关联分析
 # ============================================================
 def analyze_correlation(stock_hot, zt_dt, sectors):
-    """分析热搜与行情的关联"""
-    analysis = {
-        "hot_stock_mentions": [],
-        "hot_and_zt": [],
-        "hot_sectors": [],
-        "insights": [],
-    }
-    
-    # 提取热搜中的个股名
-    stock_names = []
-    for item in stock_hot:
-        keyword = item["keyword"]
-        clean = keyword.replace("#", "")
-        if 2 <= len(clean) <= 8:
-            stock_names.append(clean)
-    
+    analysis = {"hot_stock_mentions": [], "hot_and_zt": [], "hot_sectors": [], "insights": []}
+    stock_names = [i["keyword"].replace("#", "") for i in stock_hot if 2 <= len(i["keyword"].replace("#", "")) <= 8]
     analysis["hot_stock_mentions"] = stock_names[:10]
-    
-    # 与涨停板交叉
-    zt_names = [item["name"] for item in zt_dt.get("涨停", [])]
-    mentioned_and_zt = [name for name in stock_names if name in zt_names]
-    
-    if mentioned_and_zt:
-        analysis["hot_and_zt"] = mentioned_and_zt
-        analysis["insights"].append(
-            f"🔥 同时出现在微博热搜和涨停板: {', '.join(mentioned_and_zt)}"
-        )
-    
-    # 热搜板块
-    sector_keywords = []
-    for item in stock_hot:
-        kw = item["keyword"]
-        if any(w in kw for w in ["板块", "概念", "题材"]):
-            sector_keywords.append(kw)
-    
-    if sector_keywords:
-        analysis["hot_sectors"] = sector_keywords
-        analysis["insights"].append(
-            f"📊 热搜板块关键词: {', '.join(sector_keywords[:5])}"
-        )
-    
-    # 涨停原因分析
+    zt_names = [i["name"] for i in zt_dt.get("涨停", [])]
+    overlap = [n for n in stock_names if n in zt_names]
+    if overlap:
+        analysis["hot_and_zt"] = overlap
+        analysis["insights"].append(f"🔥 同时出现在微博热搜和涨停板: {', '.join(overlap)}")
+    sector_kw = [i["keyword"] for i in stock_hot if any(w in i["keyword"] for w in ["板块", "概念", "题材"])]
+    if sector_kw:
+        analysis["hot_sectors"] = sector_kw
+        analysis["insights"].append(f"📊 热搜板块关键词: {', '.join(sector_kw[:5])}")
     if zt_dt.get("涨停"):
         reasons = {}
         for item in zt_dt["涨停"]:
-            reason = item.get("reason", "").strip()
-            if reason:
-                reasons[reason] = reasons.get(reason, 0) + 1
-        if reasons:
-            top_reasons = sorted(reasons.items(), key=lambda x: -x[1])[:3]
-            for reason, count in top_reasons:
-                analysis["insights"].append(f"📈 涨停原因「{reason}」: {count} 只")
-    
+            r = item.get("reason", "").strip()
+            if r:
+                reasons[r] = reasons.get(r, 0) + 1
+        for r, c in sorted(reasons.items(), key=lambda x: -x[1])[:3]:
+            analysis["insights"].append(f"📈 涨停原因「{r}」: {c} 只")
     return analysis
 
 
 # ============================================================
-# 4. 本地快照缓存 (v1.1 新增)
+# 3.5 板块轮动分析 (v2.0)
+# ============================================================
+def analyze_sector_rotation():
+    """对比近3天板块数据，发现轮动趋势"""
+    snapshots = load_recent_snapshots(3)
+    if len(snapshots) < 2:
+        return None
+    try:
+        today_sectors = {s["name"]: s["change_pct"] for s in snapshots[-1].get("sectors", [])}
+        prev_sectors = {s["name"]: s["change_pct"] for s in snapshots[-2].get("sectors", [])}
+        today_set = set(today_sectors.keys())
+        prev_set = set(prev_sectors.keys())
+        new_in = today_set - prev_set
+        gone = prev_set - today_set
+        both = today_set & prev_set
+        hot_rotation = []
+        for name in both:
+            diff = today_sectors[name] - prev_sectors.get(name, 0)
+            if abs(diff) > 1:
+                hot_rotation.append({"name": name, "today": today_sectors[name], "change": round(diff, 2)})
+        hot_rotation.sort(key=lambda x: -x["change"])
+        return {
+            "new": list(new_in)[:5],
+            "gone": list(gone)[:5],
+            "hot": hot_rotation[:5],
+        }
+    except Exception:
+        return None
+
+
+# ============================================================
+# 4. 快照缓存
 # ============================================================
 def save_snapshot(data):
-    """保存当日快照"""
     os.makedirs(CACHE_DIR, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     snapshot = {
@@ -456,9 +471,7 @@ def save_snapshot(data):
     except Exception:
         pass
 
-
 def load_recent_snapshots(days=5):
-    """加载最近N天快照"""
     snapshots = []
     today = datetime.now()
     for i in range(days):
@@ -476,285 +489,279 @@ def load_recent_snapshots(days=5):
 # ============================================================
 # 5. 报告生成
 # ============================================================
-def format_hot(num):
-    """格式化热度数字"""
-    if num >= 1000000:
-        return f"{num/10000:.0f}万"
-    elif num >= 10000:
-        return f"{num/10000:.1f}万"
-    return str(num)
-
-
-def format_amount(val):
-    """格式化金额（亿/万）"""
-    if abs(val) >= 10000:
-        return f"{val/10000:.2f}万亿"
-    elif abs(val) >= 1:
-        return f"{val:.2f}亿"
-    else:
-        return f"{val*10000:.0f}万"
-
-
-def log(msg):
-    """日志输出"""
-    if not JSON_MODE:
-        print(msg, file=sys.stderr)
-
-
-def generate_report(data):
-    """生成完整报告"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
+def render_text(data, args):
     lines = []
-    lines.append(f"📊 A股微博热搜分析报告 v1.1")
-    lines.append(f"⏰ {now}")
+    lines.append("📊 A股微博热搜分析报告 v2.0")
+    lines.append(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if not is_trading_day():
+        lines.append(f"🏖️  今日非交易日，数据为最近交易日 ({get_last_trading_date()})")
     lines.append("=" * 50)
-    
+
+    # 市场情绪
+    stats = data.get("stats", {})
+    if stats:
+        total = stats.get("total", 0)
+        up = stats.get("up", 0)
+        down = stats.get("down", 0)
+        flat = stats.get("flat", 0)
+        emoji = "🟢" if up > down else "🔴" if down > up else "⚪"
+        lines.append(f"\n{emoji} 【市场情绪】")
+        lines.append("-" * 40)
+        lines.append(f"  上涨 {up} 家 / 下跌 {down} 家 / 平盘 {flat} 家（共 {total} 家）")
+        lines.append(f"  涨跌比 {up}:{down}  上涨占比 {stats.get('up_ratio', 0)}%")
+        zt_count = len(data.get("zt_dt", {}).get("涨停", []))
+        dt_count = len(data.get("zt_dt", {}).get("跌停", []))
+        if zt_count or dt_count:
+            lines.append(f"  涨停 {zt_count} 家 / 跌停 {dt_count} 家")
+
     # 大盘
-    market = data.get("market", [])
-    lines.append("")
-    lines.append("📈 【大盘概览】")
-    lines.append("-" * 40)
-    if market:
-        for m in market:
-            arrow = "🔴" if m["change_pct"] < 0 else "🟢"
-            lines.append(f"  {arrow} {m['name']}: {m['close']} ({m['change_pct']:+.2f}%)")
-    else:
-        lines.append("  数据获取中...")
-    
-    # 北向资金（v1.1 新增）
+    if data.get("market"):
+        lines.append(f"\n📈 【大盘概览】")
+        lines.append("-" * 40)
+        for idx in data["market"]:
+            emoji = "🟢" if idx["change_pct"] > 0 else "🔴" if idx["change_pct"] < 0 else "⚪"
+            lines.append(f"  {emoji} {idx['name']}: {idx['close']} ({idx['change_pct']:+.2f}%)")
+
+    # 北向资金
     nb = data.get("northbound", {})
-    if nb.get("north_net") is not None:
-        nb_arrow = "🟢 净流入" if nb["north_net"] > 0 else "🔴 净流出"
-        lines.append("")
-        lines.append("🌊 【北向资金】")
+    if nb.get("合计", {}).get("net"):
+        net = nb["合计"]["net"]
+        emoji = "🟢" if net > 0 else "🔴"
+        lines.append(f"\n🌊 【北向资金】")
         lines.append("-" * 40)
-        lines.append(f"  {nb_arrow}: {format_amount(abs(nb['north_net']))}")
-        if nb.get("沪股通") and nb["沪股通"].get("net") is not None:
-            lines.append(f"  沪股通净买入: {format_amount(abs(nb['沪股通']['net']))}")
-        if nb.get("深股通") and nb["深股通"].get("net") is not None:
-            lines.append(f"  深股通净买入: {format_amount(abs(nb['深股通']['net']))}")
-    
-    # 大盘趋势（v1.1 新增）
-    trend = data.get("trend", {})
-    if trend:
-        lines.append("")
-        lines.append("📉 【近5日趋势】")
+        lines.append(f"  {emoji} 净流入: {format_yi(net)}")
+        if nb.get("沪股通", {}).get("net"):
+            lines.append(f"  沪股通净买入: {format_yi(nb['沪股通']['net'])}")
+        if nb.get("深股通", {}).get("net"):
+            lines.append(f"  深股通净买入: {format_yi(nb['深股通']['net'])}")
+
+    # 趋势
+    if data.get("trend"):
+        lines.append(f"\n📉 【近5日趋势】")
         lines.append("-" * 40)
-        for name, info in trend.items():
+        for name, info in data["trend"].items():
             lines.append(f"  {info['direction']} {name}: {info['total_change_pct']:+.2f}% (5日)")
-            # 迷你趋势图
-            pts = info.get("trend", [])
-            if pts:
-                closes = [p["close"] for p in pts]
-                min_c, max_c = min(closes), max(closes)
-                if max_c > min_c:
-                    bar_width = 20
-                    bars = ""
-                    for c in closes:
-                        h = int((c - min_c) / (max_c - min_c) * bar_width)
-                        bars += "▓" * h + "░" * (bar_width - h) + " "
-                    lines.append(f"    {bars}")
-                    lines.append(f"    {' → '.join(str(p['close']) for p in pts)}")
-    
-    # 微博热搜
-    stock_hot = data.get("stock_hot", [])
-    lines.append("")
-    lines.append(f"🔥 【微博A股热搜】 ({len(stock_hot)} 条)")
-    lines.append("-" * 40)
-    if stock_hot:
-        for item in stock_hot[:15]:
-            lines.append(f"  #{item['keyword']}#  🔥{format_hot(item['hot'])}  ({item['match_reason']})")
-    else:
-        lines.append("  暂无A股相关热搜")
-    
-    if BRIEF_MODE:
-        lines.append("")
-        lines.append("🟢 【涨停板】")
+            if info.get("trend"):
+                prices = " → ".join(str(t["close"]) for t in info["trend"])
+                lines.append(f"    {prices}")
+
+    # 板块轮动
+    rotation = data.get("rotation")
+    if rotation:
+        lines.append(f"\n🔄 【板块轮动】")
         lines.append("-" * 40)
-        zt = data.get("zt_dt", {}).get("涨停", [])
-        for item in zt[:10]:
-            lines.append(f"  {item['name']}({item['code']}) +{item['change_pct']:.1f}%  {item.get('reason', '')}")
-        
-        lines.append("")
-        lines.append("=" * 50)
-        lines.append("📌 数据来源: 微博热搜 + AKShare")
-        return "\n".join(lines)
-    
+        if rotation.get("new"):
+            lines.append(f"  🆕 新入热门: {', '.join(rotation['new'])}")
+        if rotation.get("gone"):
+            lines.append(f"  📤 退出热门: {', '.join(rotation['gone'])}")
+        if rotation.get("hot"):
+            for h in rotation["hot"]:
+                arrow = "🔺" if h["change"] > 0 else "🔻"
+                lines.append(f"  {arrow} {h['name']}: 今日 {h['today']:+.2f}% (变化 {h['change']:+.2f}%)")
+
+    # 热搜
+    if data.get("stock_hot"):
+        lines.append(f"\n🔥 【微博A股热搜】")
+        lines.append("-" * 40)
+        for item in data["stock_hot"][:10]:
+            hot_str = format_hot(item["hot"])
+            reason = item.get("match_reason", "")
+            lines.append(f"  #{item['keyword']}#  🔥{hot_str}  ({reason})")
+
     # 涨停
-    zt = data.get("zt_dt", {}).get("涨停", [])
-    lines.append("")
-    lines.append(f"🟢 【涨停板 TOP{min(15, len(zt))}】")
-    lines.append("-" * 40)
-    if zt:
-        for item in zt[:15]:
-            lines.append(f"  {item['name']}({item['code']}) +{item['change_pct']:.1f}%  {item.get('reason', '')}")
-    else:
-        lines.append("  无涨停或数据获取中...")
-    
-    # 跌停
-    dt = data.get("zt_dt", {}).get("跌停", [])
-    lines.append("")
-    lines.append(f"🔴 【跌停板 TOP{min(15, len(dt))}】")
-    lines.append("-" * 40)
-    if dt:
-        for item in dt[:15]:
-            lines.append(f"  {item['name']}({item['code']}) {item['change_pct']:.1f}%")
-    else:
-        lines.append("  无跌停或数据获取中...")
-    
-    # 热门板块
-    sectors = data.get("sectors", [])
-    lines.append("")
-    lines.append(f"📊 【热门板块 TOP{min(10, len(sectors))}】")
-    lines.append("-" * 40)
-    if sectors:
-        for item in sectors[:10]:
-            arrow = "🔴" if item["change_pct"] < 0 else "🟢"
-            lines.append(f"  {arrow} {item['name']}: {item['change_pct']:+.2f}%  领涨: {item['leader']}")
-    else:
-        lines.append("  数据获取中...")
-    
-    # 个股排行
-    stocks = data.get("stocks", {})
-    if stocks.get("涨幅榜"):
-        lines.append("")
-        lines.append("📈 【今日涨幅榜 TOP5】")
+    zt_dt = data.get("zt_dt", {})
+    if zt_dt.get("涨停"):
+        lines.append(f"\n🟢 【涨停板 TOP10】")
         lines.append("-" * 40)
-        for item in stocks["涨幅榜"][:5]:
-            lines.append(f"  🟢 {item['name']}({item['code']}) +{item['change_pct']:.1f}%  ¥{item['price']}")
-    
-    if stocks.get("成交榜"):
-        lines.append("")
-        lines.append("💰 【今日成交额 TOP5】")
+        for item in zt_dt["涨停"][:10]:
+            lines.append(f"  {item['name']}({item['code']}) {item['change_pct']:+.1f}%  {item.get('reason', '')}")
+
+    if zt_dt.get("跌停"):
+        lines.append(f"\n🔴 【跌停板 TOP5】")
         lines.append("-" * 40)
-        for item in stocks["成交榜"][:5]:
-            vol_str = f"{item['volume']/100000000:.1f}亿" if item['volume'] >= 100000000 else f"{item['volume']/10000:.0f}万"
-            lines.append(f"  💰 {item['name']}({item['code']}) {vol_str}  {item['change_pct']:+.1f}%")
-    
+        for item in zt_dt["跌停"][:5]:
+            lines.append(f"  {item['name']}({item['code']}) {item['change_pct']:+.1f}%")
+
+    # 板块
+    if data.get("sectors"):
+        lines.append(f"\n📊 【热门板块 TOP10】")
+        lines.append("-" * 40)
+        for s in data["sectors"][:10]:
+            emoji = "🟢" if s["change_pct"] > 0 else "🔴"
+            lines.append(f"  {emoji} {s['name']}: {s['change_pct']:+.2f}%  领涨: {s.get('leader', '')}")
+
     # 关联分析
     corr = data.get("correlation", {})
-    lines.append("")
-    lines.append("🔗 【热搜 vs 行情 关联分析】")
-    lines.append("-" * 40)
-    
-    if corr.get("hot_stock_mentions"):
-        lines.append(f"  💬 热搜提及个股: {', '.join(corr['hot_stock_mentions'][:5])}")
-    
-    if corr.get("hot_and_zt"):
-        lines.append(f"  🔥 热搜+涨停双重热度: {', '.join(corr['hot_and_zt'])}")
-    
-    if corr.get("hot_sectors"):
-        lines.append(f"  📊 热搜板块: {', '.join(corr['hot_sectors'][:3])}")
-    
     if corr.get("insights"):
-        for note in corr["insights"]:
-            lines.append(f"  {note}")
-    
-    if not corr.get("insights") and not corr.get("hot_stock_mentions"):
-        lines.append("  暂无明显关联")
-    
-    # 历史快照对比（v1.1 新增）
-    snapshots = data.get("snapshots", [])
-    if snapshots and len(snapshots) >= 2:
-        lines.append("")
-        lines.append("📅 【历史数据对比】")
+        lines.append(f"\n🔗 【热搜 vs 行情 关联分析】")
         lines.append("-" * 40)
-        for snap in snapshots[-5:]:
-            date = snap["date"]
-            snap_zt = len(snap.get("zt_dt", {}).get("涨停", []))
-            snap_dt = len(snap.get("zt_dt", {}).get("跌停", []))
-            snap_sectors = len(snap.get("sectors", []))
-            snap_nb = snap.get("northbound", {})
-            nb_val = snap_nb.get("north_net", "N/A")
-            nb_str = f"  北向: {format_amount(abs(nb_val))}" if isinstance(nb_val, (int, float)) else ""
-            lines.append(f"  📌 {date}: 涨停{snap_zt}家 / 跌停{snap_dt}家 / 板块{snap_sectors}个{nb_str}")
-    
+        for insight in corr["insights"]:
+            lines.append(f"  {insight}")
+
+    # 历史对比
+    snapshots = load_recent_snapshots(5)
+    if len(snapshots) > 1:
+        lines.append(f"\n📅 【历史数据对比】")
+        lines.append("-" * 40)
+        for snap in reversed(snapshots):
+            zt_c = len(snap.get("zt_dt", {}).get("涨停", []))
+            dt_c = len(snap.get("zt_dt", {}).get("跌停", []))
+            sec_c = len(snap.get("sectors", []))
+            nb_net = snap.get("northbound", {}).get("合计", {}).get("net", 0)
+            nb_str = format_yi(nb_net) if nb_net else "N/A"
+            lines.append(f"  📌 {snap['date']}: 涨停{zt_c}家 / 跌停{dt_c}家 / 板块{sec_c}个  北向: {nb_str}")
+
     lines.append("")
-    lines.append("=" * 50)
-    lines.append("📌 数据来源: 微博热搜 + AKShare (东方财富)")
-    lines.append("🆕 v1.1 新增: 北向资金 / 大盘趋势 / 关键词增强 / 历史快照")
-    lines.append("⚠️ 仅供参考，不构成投资建议")
-    
+    return "\n".join(lines)
+
+
+def render_markdown(data, args):
+    """Markdown 格式输出"""
+    lines = []
+    lines.append("# 📊 A股微博热搜分析报告 v2.0")
+    lines.append(f"> ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if not is_trading_day():
+        lines.append(f"> 🏖️  今日非交易日，数据为最近交易日 ({get_last_trading_date()})")
+    lines.append("")
+
+    stats = data.get("stats", {})
+    if stats:
+        total = stats.get("total", 0)
+        up = stats.get("up", 0)
+        down = stats.get("down", 0)
+        lines.append(f"## 市场情绪")
+        lines.append(f"| 上涨 | 下跌 | 平盘 | 涨跌比 |")
+        lines.append(f"|------|------|------|--------|")
+        lines.append(f"| {up} | {down} | {stats.get('flat', 0)} | {up}:{down} |")
+        lines.append("")
+
+    if data.get("market"):
+        lines.append("## 大盘概览")
+        lines.append("| 指数 | 收盘 | 涨跌幅 |")
+        lines.append("|------|------|--------|")
+        for idx in data["market"]:
+            emoji = "🟢" if idx["change_pct"] > 0 else "🔴" if idx["change_pct"] < 0 else "⚪"
+            lines.append(f"| {emoji} {idx['name']} | {idx['close']} | {idx['change_pct']:+.2f}% |")
+        lines.append("")
+
+    if data.get("stock_hot"):
+        lines.append("## 🔥 微博A股热搜")
+        for item in data["stock_hot"][:10]:
+            lines.append(f"- **#{item['keyword']}#** 🔥{format_hot(item['hot'])} ({item.get('match_reason', '')})")
+        lines.append("")
+
+    if zt_dt := data.get("zt_dt", {}):
+        if zt_dt.get("涨停"):
+            lines.append("## 🟢 涨停板 TOP10")
+            for item in zt_dt["涨停"][:10]:
+                lines.append(f"- {item['name']}({item['code']}) {item['change_pct']:+.1f}% {item.get('reason', '')}")
+            lines.append("")
+
+    corr = data.get("correlation", {})
+    if corr.get("insights"):
+        lines.append("## 🔗 关联分析")
+        for insight in corr["insights"]:
+            lines.append(f"- {insight}")
+        lines.append("")
+
+    lines.append(f"\n---\n*Generated by A股分析 v{VERSION}*")
     return "\n".join(lines)
 
 
 # ============================================================
-# Main
+# 6. 主函数
 # ============================================================
-def main():
-    log("🔍 正在抓取数据... (v1.1)\n")
-    
+def collect_data(args):
+    """并行收集所有数据"""
     data = {}
-    
-    # 1. 微博热搜
-    if not NO_WEIBO:
-        log("  📱 微博热搜...")
-        hot_list = fetch_weibo_hot()
-        data["weibo_hot_total"] = len(hot_list)
-        data["stock_hot"] = filter_stock_keywords(hot_list)
+    watchlist = args.watchlist.split(",") if args.watchlist else None
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {}
+        if not args.no_weibo:
+            futures["weibo"] = executor.submit(fetch_weibo_hot)
+        if not args.no_market:
+            futures["market"] = executor.submit(fetch_market_overview)
+            futures["trend"] = executor.submit(fetch_market_trend)
+            futures["zt_dt"] = executor.submit(fetch_zt_dt)
+            futures["sectors"] = executor.submit(fetch_hot_sectors)
+            futures["northbound"] = executor.submit(fetch_northbound_flow)
+            futures["stats"] = executor.submit(fetch_market_stats)
+
+        for name, future in futures.items():
+            try:
+                data[name] = future.result(timeout=30)
+            except Exception as e:
+                log(f"⚠️  {name} 数据获取超时: {e}")
+                data[name] = {} if name != "weibo" else []
+
+    # 处理热搜
+    if data.get("weibo"):
+        data["stock_hot"] = filter_stock_keywords(data["weibo"], watchlist)
     else:
         data["stock_hot"] = []
-    
-    # 2. 大盘指数
-    if not NO_MARKET:
-        log("  📈 大盘指数...")
-        data["market"] = fetch_market_overview()
+
+    # 关联分析
+    if data.get("stock_hot") and data.get("zt_dt"):
+        data["correlation"] = analyze_correlation(data["stock_hot"], data["zt_dt"], data.get("sectors", []))
     else:
-        data["market"] = []
-    
-    # 3. 涨停/跌停
-    if not NO_MARKET:
-        log("  🟢 涨停/跌停...")
-        data["zt_dt"] = fetch_zt_dt()
+        data["correlation"] = {}
+
+    # 板块轮动
+    if not args.no_market:
+        data["rotation"] = analyze_sector_rotation()
+
+    # 保存快照
+    if not args.no_market:
+        save_snapshot(data)
+
+    return data
+
+
+def main():
+    parser = argparse.ArgumentParser(description="A股微博热搜分析 v2.0", formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="JSON 格式输出")
+    parser.add_argument("--brief", action="store_true", help="精简模式：仅热搜 + 涨停")
+    parser.add_argument("--trend", action="store_true", help="趋势模式：含大盘5日走势")
+    parser.add_argument("--md", action="store_true", help="Markdown 格式输出")
+    parser.add_argument("--no-weibo", action="store_true", help="跳过微博数据")
+    parser.add_argument("--no-market", action="store_true", help="跳过行情数据")
+    parser.add_argument("--stock", type=str, help="查询单只股票（代码）")
+    parser.add_argument("--watchlist", type=str, help="自选股（逗号分隔）")
+    parser.add_argument("--version", action="version", version=f"A股分析 v{VERSION}")
+    args = parser.parse_args()
+
+    # 单股查询
+    if args.stock:
+        info = fetch_single_stock(args.stock)
+        if info:
+            if args.json:
+                print(json.dumps(info, ensure_ascii=False, indent=2))
+            else:
+                emoji = "🟢" if info["change_pct"] > 0 else "🔴" if info["change_pct"] < 0 else "⚪"
+                print(f"\n{emoji} {info['name']} ({info['code']})")
+                print(f"  最新价: {info['price']}  涨跌: {info['change_pct']:+.2f}% ({info['change_amt']:+.2f})")
+                print(f"  今开: {info['open']}  最高: {info['high']}  最低: {info['low']}  昨收: {info['prev_close']}")
+                print(f"  成交量: {info['volume']:.0f}  成交额: {info['turnover']:.0f}")
+                if info.get("pe"):
+                    print(f"  市盈率: {info['pe']}")
+        else:
+            print(f"❌ 未找到股票 {args.stock}")
+        return
+
+    data = collect_data(args)
+
+    if args.json:
+        # JSON 模式：去掉不可序列化的部分
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    elif args.md:
+        print(render_markdown(data, args))
+    elif args.brief:
+        # 精简模式：只输出热搜+涨停
+        brief_data = {"stock_hot": data.get("stock_hot", []), "zt_dt": data.get("zt_dt", {})}
+        print(render_text(brief_data, args))
     else:
-        data["zt_dt"] = {"涨停": [], "跌停": []}
-    
-    # 4. 热门板块
-    if not NO_MARKET and not BRIEF_MODE:
-        log("  📊 热门板块...")
-        data["sectors"] = fetch_hot_sectors()
-    else:
-        data["sectors"] = []
-    
-    # 5. 个股排行
-    if not NO_MARKET and not BRIEF_MODE:
-        log("  📈 个股排行...")
-        data["stocks"] = fetch_top_stocks()
-    else:
-        data["stocks"] = {}
-    
-    # 6. 北向资金 (v1.1 新增)
-    if not NO_MARKET:
-        log("  🌊 北向资金...")
-        data["northbound"] = fetch_northbound_flow()
-    else:
-        data["northbound"] = {}
-    
-    # 7. 大盘趋势 (v1.1 新增)
-    if not NO_MARKET and TREND_MODE:
-        log("  📉 大盘趋势...")
-        data["trend"] = fetch_market_trend(days=5)
-    else:
-        data["trend"] = {}
-    
-    # 8. 关联分析
-    log("  🔗 关联分析...")
-    data["correlation"] = analyze_correlation(data["stock_hot"], data["zt_dt"], data["sectors"])
-    
-    # 9. 保存快照
-    save_snapshot(data)
-    
-    # 10. 加载历史快照
-    if not BRIEF_MODE:
-        data["snapshots"] = load_recent_snapshots(days=5)
-    
-    # 11. 输出
-    if JSON_MODE:
-        data["timestamp"] = datetime.now().isoformat()
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    else:
-        print(generate_report(data))
+        print(render_text(data, args))
 
 
 if __name__ == "__main__":
