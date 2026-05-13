@@ -1,16 +1,16 @@
 ---
-name: V2.0 CNY RMB A股 China A shares Stock
-version: 2.0.0
+name: V2.1 CNY RMB A股 China A shares Stock
+version: 2.1.0
 description: >
-  V2.0 CNY RMB A股热搜分析 - China A Shares Stock Skill
-  微博热搜 + A股行情 + 关联分析 + 北向资金 + 板块轮动 + 市场情绪，一站式掌握市场热点。
-  关键词：A股, 大A, A-shares, China A, Onshore, 涨停, 跌停, 热搜, 北向资金, 板块轮动, 市场情绪
+  V2.1 CNY RMB A股热搜分析 - China A Shares Stock Skill
+  微博热搜 + A股行情 + 关联分析 + 北向资金 + 板块轮动 + 市场情绪 + 东方财富股吧 + 财经新闻，一站式掌握市场热点。
+  关键词：A股, 大A, A-shares, China A, Onshore, 涨停, 跌停, 热搜, 北向资金, 板块轮动, 市场情绪, 股吧, 新闻
 applyTo: "**"
 ---
 
-# V2.0 CNY RMB A股热搜分析
+# V2.1 CNY RMB A股热搜分析
 
-微博热搜 + A股行情 + 关联分析，一站式掌握市场热点。
+微博热搜 + A股行情 + 关联分析 + 东方财富股吧 + 财经新闻，一站式掌握市场热点。
 
 > **关于作者** — 米粉，A股老韭菜，美股老韭菜，期货老韭菜，币圈老韭菜，被割多了，现在只看不玩，用MIMO做个Skill大家娱乐围观A股行情，好用记得回来点星星。⭐
 >
@@ -39,6 +39,10 @@ applyTo: "**"
 - ✅ 🆕 并行数据抓取（ThreadPoolExecutor）
 - ✅ 🆕 argparse 命令行参数（支持 --help）
 - ✅ 🆕 北向资金列名兼容容错
+- ✅ 🆕 `--guba` 东方财富股吧热帖（涨停股吧 + 自选股吧）
+- ✅ 🆕 `--news` 财经新闻聚合（东方财富 + 第一财经 + 证券时报）
+- ✅ 🆕 `--all` 一键显示全部数据（股吧 + 新闻）
+- ✅ 🆕 `--xueqiu` 雪球讨论（可选，需配置 token）
 
 ## When to Use
 
@@ -71,6 +75,10 @@ python3 "{baseDir}/scripts/analyzer.py" [options]
 | `--no-market` | 跳过行情数据（只看热搜） |
 | `--stock <代码>` | 查询单只股票详情 |
 | `--watchlist <股票1,股票2>` | 自选股过滤（逗号分隔） |
+| `--guba` | 东方财富股吧热帖 |
+| `--news` | 财经新闻聚合 |
+| `--all` | 全部数据（股吧 + 新闻） |
+| `--xueqiu` | 雪球讨论（需配置 token） |
 | `--version` | 显示版本号 |
 | `-h, --help` | 显示帮助信息 |
 
@@ -227,6 +235,14 @@ python3 "{baseDir}/scripts/analyzer.py" --trend --brief
 | 北向资金数据为0 | 非交易时段北向资金为0是正常的 |
 
 ## 版本历史
+
+### v2.1.0 (2026-05-13)
+- 🆕 `--guba` 东方财富股吧热帖（涨停股吧 + 自选股吧）
+- 🆕 `--news` 财经新闻聚合（东方财富 + 第一财经 + 证券时报 RSS）
+- 🆕 `--all` 一键显示全部数据（股吧 + 新闻）
+- 🆕 `--xueqiu` 雪球讨论（可选，需配置 token）
+- 🆕 v2_1_patch.py 独立模块，社区+新闻数据并行抓取
+- 🔧 brief 模式支持显示社区数据
 
 ### v2.0.0 (2026-05-12)
 - 🆕 `--stock` 单只股票查询
